@@ -260,6 +260,8 @@ class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
     timeout: int = 60
+    deny_patterns: list[str] = Field(default_factory=list)  # Regex patterns to block commands
+    allow_patterns: list[str] = Field(default_factory=list)  # If set, only these commands are allowed
 
 
 class MCPServerConfig(Base):
