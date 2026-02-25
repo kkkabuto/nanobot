@@ -109,6 +109,8 @@ class AgentLoop:
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
+            deny_patterns=self.exec_config.deny_patterns or None,
+            allow_patterns=self.exec_config.allow_patterns or None,
             restrict_to_workspace=self.restrict_to_workspace,
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
@@ -340,12 +342,14 @@ class AgentLoop:
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
+                                metadata=msg.metadata or {},
                             )
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Memory archival failed, session not cleared. Please try again.",
+                    metadata=msg.metadata or {},
                 )
             finally:
                 self._consolidating.discard(session.key)
@@ -355,10 +359,11 @@ class AgentLoop:
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+                                  content="New session started.", metadata=msg.metadata or {})
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands",
+                                  metadata=msg.metadata or {})
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):

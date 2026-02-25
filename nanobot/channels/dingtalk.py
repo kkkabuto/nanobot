@@ -67,17 +67,29 @@ class NanobotDingTalkHandler(CallbackHandler):
             sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
             sender_name = chatbot_msg.sender_nick or "Unknown"
 
-            # Extract conversation_id for group chat support
-            # conversation_id exists in group messages, None in private messages
+            # Extract conversation info for group chat support
+            # conversationType: 1 = private chat, 2 = group chat
+            # Note: DingTalk may return conversationType=1 even for group chats,
+            # so we treat any message with conversation_id as potential group message
             conversation_id = getattr(chatbot_msg, "conversation_id", None)
-            is_group = conversation_id is not None
+            conversation_type = getattr(chatbot_msg, "conversation_type", None)
+            conversation_title = getattr(chatbot_msg, "conversation_title", None)
+
+            # Determine if this is a group chat:
+            # - conversation_type == 2: definitely group
+            # - has conversation_id: might be group (try group API first)
+            # - conversation_title is not None: likely group
+            is_group = conversation_type == 2 or conversation_id is not None
 
             # Check if bot is mentioned (@) in group chat
             is_at = getattr(chatbot_msg, "is_in_at_list", False)
 
             logger.info(
-                "Received DingTalk {} message from {} ({}): {}",
+                "Received DingTalk {} message (convType={}, convId={}, title={}) from {} ({}): {}",
                 "group" if is_group else "private",
+                conversation_type,
+                conversation_id[:20] + "..." if conversation_id and len(conversation_id) > 20 else conversation_id,
+                conversation_title,
                 sender_name,
                 sender_id,
                 content,
@@ -303,6 +315,12 @@ class DingTalkChannel(BaseChannel):
         try:
             # For group chat, use conversation_id as chat_id; for private, use sender_id
             chat_id = conversation_id if is_group else sender_id
+
+            # Debug logging
+            logger.info(
+                "DingTalk _on_message: is_group={}, conversation_id={}, sender_id={}, chat_id={}",
+                is_group, conversation_id, sender_id, chat_id,
+            )
 
             logger.info(
                 "DingTalk inbound ({}): {} from {}",
