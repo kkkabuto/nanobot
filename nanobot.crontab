@@ -1,0 +1,2 @@
+# Nanobot cron jobs - catchup mode (runs every 30 minutes to check for missed jobs)
+*/30 * * * * /Users/xinhao/miniforge3/bin/python -m nanobot.cli.commands cron catchup 2>&1 >> /tmp/nanobot-cron.log

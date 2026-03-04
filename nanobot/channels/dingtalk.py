@@ -228,67 +228,266 @@ class DingTalkChannel(BaseChannel):
             logger.error("Failed to get DingTalk access token: {}", e)
             return None
 
+    async def _compress_image(self, file_path: str, max_size: int = 1024 * 1024) -> str | None:
+        """Compress image to be under max_size (default 1MB).
+
+        Returns path to temporary compressed file, or None if compression fails.
+        """
+        import os
+
+        try:
+            from PIL import Image
+            import io
+
+            # Check current file size
+            file_size = os.path.getsize(file_path)
+            if file_size <= max_size:
+                return file_path  # No need to compress
+
+            # Open image
+            with Image.open(file_path) as img:
+                # Convert RGBA to RGB if necessary
+                if img.mode == 'RGBA':
+                    img = img.convert('RGB')
+
+                # Start with original size and quality
+                quality = 85
+                max_dimension = 1920  # Max width/height
+
+                # Resize if image is too large
+                width, height = img.size
+                if width > max_dimension or height > max_dimension:
+                    ratio = min(max_dimension / width, max_dimension / height)
+                    new_size = (int(width * ratio), int(height * ratio))
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+                # Try progressively lower quality until under max_size
+                import os
+                temp_path = f"/tmp/compressed_{os.path.basename(file_path)}"
+                while quality >= 40:
+                    buffer = io.BytesIO()
+                    img.save(buffer, format='JPEG', quality=quality, optimize=True)
+                    size = buffer.tell()
+
+                    if size <= max_size:
+                        with open(temp_path, 'wb') as f:
+                            f.write(buffer.getvalue())
+                        logger.debug(
+                            "Image compressed: {} -> {} bytes (quality={})",
+                            file_size, size, quality
+                        )
+                        return temp_path
+
+                    quality -= 10
+
+                # If still too large, try with smaller dimensions
+                while quality >= 40 and (width > 800 or height > 800):
+                    ratio = 0.8
+                    width = int(width * ratio)
+                    height = int(height * ratio)
+                    img = img.resize((width, height), Image.Resampling.LANCZOS)
+
+                    buffer = io.BytesIO()
+                    img.save(buffer, format='JPEG', quality=quality, optimize=True)
+                    size = buffer.tell()
+
+                    if size <= max_size:
+                        with open(temp_path, 'wb') as f:
+                            f.write(buffer.getvalue())
+                        logger.debug(
+                            "Image compressed with resize: {} -> {} bytes ({}x{})",
+                            file_size, size, width, height
+                        )
+                        return temp_path
+
+            logger.warning("Could not compress image under {} bytes", max_size)
+            return None
+        except ImportError:
+            logger.warning("PIL not available for image compression")
+            return None
+        except Exception as e:
+            logger.error("Error compressing image: {}", e)
+            return None
+
+    async def _upload_image(self, file_path: str, token: str) -> str | None:
+        """Upload image to DingTalk and return mediaId.
+
+        Uses the robot message file upload API:
+        https://open.dingtalk.com/document/robots/upload-media-files
+        DingTalk has a 2MB limit for image uploads.
+        """
+        import mimetypes
+        import os
+
+        url = "https://oapi.dingtalk.com/media/upload"
+        headers = {"x-acs-dingtalk-access-token": token}
+
+        # Check file size (DingTalk limit is 2MB, use 1.5MB to be safe)
+        file_size = os.path.getsize(file_path)
+        max_upload_size = 1.5 * 1024 * 1024  # 1.5MB
+
+        upload_path = file_path
+        if file_size > max_upload_size:
+            logger.info("Image too large ({} bytes), attempting compression", file_size)
+            compressed = await self._compress_image(file_path, max_size=max_upload_size)
+            if compressed and compressed != file_path:
+                upload_path = compressed
+            else:
+                logger.error("Image compression failed, cannot upload")
+                return None
+
+        # Guess content type
+        content_type, _ = mimetypes.guess_type(upload_path)
+        content_type = content_type or "image/png"
+
+        try:
+            with open(upload_path, "rb") as f:
+                files = {
+                    "media": (os.path.basename(upload_path), f, content_type),
+                }
+                # Old API uses access_token as query param
+                upload_url = f"{url}?access_token={token}&type=image"
+                resp = await self._http.post(upload_url, files=files)
+
+            if resp.status_code != 200:
+                logger.error("DingTalk image upload failed: {}", resp.text)
+                return None
+
+            result = resp.json()
+            media_id = result.get("media_id")
+            if media_id:
+                logger.debug("DingTalk image uploaded: media_id={}", media_id)
+            return media_id
+        except Exception as e:
+            logger.error("Error uploading image to DingTalk: {}", e)
+            return None
+        finally:
+            # Clean up temp file if we created one
+            if upload_path != file_path and upload_path.startswith("/tmp/"):
+                try:
+                    import os
+                    os.remove(upload_path)
+                except:
+                    pass
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through DingTalk.
 
         Supports both private (1:1) and group chat:
         - Group chat: when metadata contains is_group=True, uses groupMessages API
         - Private chat: uses oToMessages/batchSend API
+
+        For media (images), uploads first then sends with sampleImage msgKey.
         """
         token = await self._get_access_token()
         if not token:
             return
 
         headers = {"x-acs-dingtalk-access-token": token}
+        # Determine if this is a group chat:
+        # 1. Check metadata from MessageTool (if available)
+        # 2. Fallback: DingTalk conversation IDs start with "cid" (e.g., cid5/xxx)
         is_group = msg.metadata.get("is_group", False)
-
-        if is_group:
-            # Group chat: use groupMessages/send API
-            # https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message
-            url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
-            data = {
-                "robotCode": self.config.client_id,
-                "openConversationId": msg.chat_id,  # conversation_id from group message
-                "msgKey": "sampleMarkdown",
-                "msgParam": json.dumps({
-                    "text": msg.content,
-                    "title": "Nanobot Reply",
-                }, ensure_ascii=False),
-            }
-            # Optional: @mention users in group
-            at_user_ids = msg.metadata.get("at_user_ids", [])
-            if at_user_ids:
-                data["atUserIds"] = at_user_ids
-        else:
-            # Private chat: use oToMessages/batchSend API
-            # https://open.dingtalk.com/document/orgapp/robot-batch-send-messages
-            url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
-            data = {
-                "robotCode": self.config.client_id,
-                "userIds": [msg.chat_id],  # chat_id is the user's staffId
-                "msgKey": "sampleMarkdown",
-                "msgParam": json.dumps({
-                    "text": msg.content,
-                    "title": "Nanobot Reply",
-                }, ensure_ascii=False),
-            }
+        if not is_group and msg.chat_id.startswith("cid"):
+            is_group = True
 
         if not self._http:
             logger.warning("DingTalk HTTP client not initialized, cannot send")
             return
 
-        try:
-            resp = await self._http.post(url, json=data, headers=headers)
-            if resp.status_code != 200:
-                logger.error("DingTalk send failed: {}", resp.text)
+        # Handle media (images) - upload and send
+        if msg.media:
+            for media_path in msg.media:
+                media_id = await self._upload_image(media_path, token)
+                if media_id:
+                    # Send image embedded in markdown ( DingTalk group message supports markdown images)
+                    markdown_text = f"![image]({media_id})"
+                    if msg.content:
+                        markdown_text = msg.content + "\n" + markdown_text
+
+                    if is_group:
+                        url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                        data = {
+                            "robotCode": self.config.client_id,
+                            "openConversationId": msg.chat_id,
+                            "msgKey": "sampleMarkdown",
+                            "msgParam": json.dumps({
+                                "title": "Nanobot Image",
+                                "text": markdown_text,
+                            }, ensure_ascii=False),
+                        }
+                    else:
+                        url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                        data = {
+                            "robotCode": self.config.client_id,
+                            "userIds": [msg.chat_id],
+                            "msgKey": "sampleMarkdown",
+                            "msgParam": json.dumps({
+                                "title": "Nanobot Image",
+                                "text": markdown_text,
+                            }, ensure_ascii=False),
+                        }
+                    try:
+                        resp = await self._http.post(url, json=data, headers=headers)
+                        if resp.status_code != 200:
+                            logger.error("DingTalk image send failed: {}", resp.text)
+                        else:
+                            logger.debug(
+                                "DingTalk {} image sent to {}",
+                                "group" if is_group else "private",
+                                msg.chat_id,
+                            )
+                    except Exception as e:
+                        logger.error("Error sending DingTalk image: {}", e)
+                else:
+                    logger.error("Failed to upload image: {}", media_path)
+
+        # Send text message if content exists (and wasn't already sent with images)
+        content_sent_with_images = bool(msg.media and msg.content)
+        if msg.content and not content_sent_with_images:
+            if is_group:
+                # Group chat: use groupMessages/send API
+                # https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message
+                url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                data = {
+                    "robotCode": self.config.client_id,
+                    "openConversationId": msg.chat_id,  # conversation_id from group message
+                    "msgKey": "sampleMarkdown",
+                    "msgParam": json.dumps({
+                        "text": msg.content,
+                        "title": "Nanobot Reply",
+                    }, ensure_ascii=False),
+                }
+                # Optional: @mention users in group
+                at_user_ids = msg.metadata.get("at_user_ids", [])
+                if at_user_ids:
+                    data["atUserIds"] = at_user_ids
             else:
-                logger.debug(
-                    "DingTalk {} message sent to {}",
-                    "group" if is_group else "private",
-                    msg.chat_id,
-                )
-        except Exception as e:
-            logger.error("Error sending DingTalk message: {}", e)
+                # Private chat: use oToMessages/batchSend API
+                # https://open.dingtalk.com/document/orgapp/robot-batch-send-messages
+                url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                data = {
+                    "robotCode": self.config.client_id,
+                    "userIds": [msg.chat_id],  # chat_id is the user's staffId
+                    "msgKey": "sampleMarkdown",
+                    "msgParam": json.dumps({
+                        "text": msg.content,
+                        "title": "Nanobot Reply",
+                    }, ensure_ascii=False),
+                }
+
+            try:
+                resp = await self._http.post(url, json=data, headers=headers)
+                if resp.status_code != 200:
+                    logger.error("DingTalk send failed: {}", resp.text)
+                else:
+                    logger.debug(
+                        "DingTalk {} message sent to {}",
+                        "group" if is_group else "private",
+                        msg.chat_id,
+                    )
+            except Exception as e:
+                logger.error("Error sending DingTalk message: {}", e)
 
     async def _on_message(
         self,

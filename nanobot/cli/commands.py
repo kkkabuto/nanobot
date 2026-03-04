@@ -995,6 +995,130 @@ def cron_run(
         console.print(f"[red]Failed to run job {job_id}[/red]")
 
 
+@cron_app.command("catchup")
+def cron_catchup(
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be executed without running"),
+    window_minutes: int = typer.Option(35, "--window", "-w", help="Time window in minutes to check for missed jobs"),
+):
+    """Run jobs that should have executed within the time window.
+
+    This command checks for cron jobs whose scheduled time falls within the specified
+    window (default: last 35 minutes). Use this with system crontab to ensure jobs run
+    even when nanobot service is not continuously running.
+
+    Recommended crontab entry (every 30 minutes):
+        */30 * * * * cd /path/to/nanobot && python -m nanobot.cli.commands cron catchup
+
+    This catches jobs scheduled at specific times (e.g., 12:00, 12:05) even if the
+    catchup runs slightly later (e.g., 12:30).
+    """
+    import asyncio
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from croniter import croniter
+    from loguru import logger
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
+    logger.disable("nanobot")
+
+    config = load_config()
+    bus = MessageBus()
+    provider = _make_provider(config)
+
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        memory_window=config.agents.defaults.memory_window,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        cron_service=None,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        session_manager=None,
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+    )
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    async def on_job(job: CronJob) -> str | None:
+        response = await agent_loop.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+        )
+        if job.payload.deliver and job.payload.to and job.payload.channel:
+            from nanobot.bus.events import OutboundMessage
+            await bus.publish_outbound(OutboundMessage(
+                channel=job.payload.channel,
+                chat_id=job.payload.to,
+                content=response or "",
+            ))
+        return response
+
+    service.on_job = on_job
+
+    # Determine time window: now - window_minutes to now
+    tz = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(tz)
+    window_start = now - timedelta(minutes=window_minutes)
+
+    service._load_store()
+    jobs_to_run: list[CronJob] = []
+
+    for job in service._store.jobs if service._store else []:
+        if not job.enabled or job.schedule.kind != "cron":
+            continue
+
+        expr = job.schedule.expr
+        job_tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else tz
+
+        # Check if this job should have run within the window
+        try:
+            # Get the previous scheduled time before now
+            itr = croniter(expr, now)
+            prev_run = itr.get_prev(datetime)
+
+            # Check if prev_run falls within our window
+            if prev_run >= window_start:
+                jobs_to_run.append(job)
+        except Exception:
+            continue
+
+    if not jobs_to_run:
+        console.print(f"[dim]No jobs scheduled in the last {window_minutes} minutes.[/dim]")
+        raise typer.Exit(0)
+
+    if dry_run:
+        console.print(f"[yellow]Would execute {len(jobs_to_run)} job(s) within {window_minutes}min window:[/yellow]")
+        for job in jobs_to_run:
+            console.print(f"  - {job.name}")
+        raise typer.Exit(0)
+
+    console.print(f"Executing {len(jobs_to_run)} job(s)...")
+
+    async def run_jobs():
+        for job in jobs_to_run:
+            await service._execute_job(job)
+        service._save_store()
+
+    try:
+        asyncio.run(run_jobs())
+        console.print(f"[green]✓[/green] Executed {len(jobs_to_run)} job(s)")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+
 # ============================================================================
 # Status Commands
 # ============================================================================

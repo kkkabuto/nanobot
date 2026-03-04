@@ -164,14 +164,31 @@ class CronService:
         
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     
-    async def start(self) -> None:
-        """Start the cron service."""
+    async def start(self, run_catchup: bool = False) -> list[CronJob] | None:
+        """Start the cron service.
+
+        Args:
+            run_catchup: If True, execute missed jobs from the last scheduled time.
+
+        Returns:
+            List of jobs that were caught up and executed (only when run_catchup=True).
+        """
         self._running = True
         self._load_store()
-        self._recompute_next_runs()
+        missed = self._recompute_next_runs(catchup=run_catchup)
+
+        # Execute missed jobs if catchup is enabled
+        caught_up: list[CronJob] = []
+        if run_catchup and missed and self.on_job:
+            for job in missed:
+                logger.info("Cron: catching up job '{}' ({})", job.name, job.id)
+                await self._execute_job(job)
+                caught_up.append(job)
+
         self._save_store()
         self._arm_timer()
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
+        return caught_up if run_catchup else None
     
     def stop(self) -> None:
         """Stop the cron service."""
@@ -180,14 +197,35 @@ class CronService:
             self._timer_task.cancel()
             self._timer_task = None
     
-    def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+    def _recompute_next_runs(self, catchup: bool = False) -> list[CronJob]:
+        """Recompute next run times for enabled jobs that need it.
+
+        Only recompute if:
+        1. next_run_at_ms is None (new job or reset)
+        2. next_run_at_ms has already passed (missed run, schedule next valid time)
+        Otherwise, preserve the existing next_run_at_ms to avoid skipping scheduled runs.
+
+        Args:
+            catchup: If True, return jobs that were missed (for catchup execution).
+
+        Returns:
+            List of jobs that were missed (only when catchup=True).
+        """
+        missed_jobs: list[CronJob] = []
         if not self._store:
-            return
+            return missed_jobs
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                next_run = job.state.next_run_at_ms
+                # Only recompute if no next_run set, or if it has already passed
+                if next_run is None or next_run <= now:
+                    if catchup and next_run is not None and next_run <= now:
+                        # This is a missed job - check if it should have run today
+                        if job.schedule.kind == "cron":
+                            missed_jobs.append(job)
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+        return missed_jobs
     
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -365,3 +403,77 @@ class CronService:
             "jobs": len(store.jobs),
             "next_wake_at_ms": self._get_next_wake_ms(),
         }
+
+    def get_missed_jobs(self, lookback_ms: int | None = None) -> list[CronJob]:
+        """Get list of jobs that should have run but didn't.
+
+        Args:
+            lookback_ms: How far back to check for missed runs. If None,
+                        only checks since last_run_at_ms.
+
+        Returns:
+            List of jobs that have missed their scheduled run time.
+        """
+        store = self._load_store()
+        now = _now_ms()
+        missed = []
+
+        for job in store.jobs:
+            if not job.enabled:
+                continue
+
+            # For cron schedules, check if we missed a run
+            if job.schedule.kind == "cron" and job.schedule.expr:
+                from croniter import croniter
+                from zoneinfo import ZoneInfo
+
+                tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else datetime.now().astimezone().tzinfo
+                last_run = job.state.last_run_at_ms
+
+                # If never run, check from schedule creation time
+                if last_run is None:
+                    last_run = job.created_at_ms
+
+                # Get all scheduled times between last_run and now
+                last_run_dt = datetime.fromtimestamp(last_run / 1000, tz=tz)
+                now_dt = datetime.fromtimestamp(now / 1000, tz=tz)
+
+                cron = croniter(job.schedule.expr, last_run_dt)
+                next_scheduled = cron.get_next(datetime)
+
+                # If there's a scheduled time between last_run and now, we missed it
+                if next_scheduled < now_dt:
+                    missed.append(job)
+
+            # For every schedules, check based on interval
+            elif job.schedule.kind == "every" and job.schedule.every_ms:
+                last_run = job.state.last_run_at_ms
+                if last_run is None:
+                    last_run = job.created_at_ms
+
+                elapsed = now - last_run
+                if elapsed >= job.schedule.every_ms:
+                    missed.append(job)
+
+        return missed
+
+    async def run_missed_jobs(self) -> list[tuple[str, str]]:
+        """Execute all missed jobs and return results.
+
+        Returns:
+            List of (job_id, status) tuples where status is "ok" or error message.
+        """
+        missed = self.get_missed_jobs()
+        results = []
+
+        for job in missed:
+            await self._execute_job(job)
+            status = job.state.last_status or "unknown"
+            if job.state.last_error:
+                status = f"error: {job.state.last_error}"
+            results.append((job.id, status))
+
+        if missed:
+            self._save_store()
+
+        return results
